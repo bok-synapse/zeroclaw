@@ -1,0 +1,24 @@
+name: Build with Matrix  
+on:  
+  push:  
+    branches: [main]  
+  
+jobs:  
+  build:  
+    runs-on: ubuntu-latest  
+    steps:  
+      - uses: actions/checkout@v4  
+      - uses: dtolnay/rust-toolchain@stable  
+        with:  
+          toolchain: 1.92.0  
+      - uses: useblacksmith/rust-cache@v3  
+      - name: Install libudev  
+        run: sudo apt-get install -y libudev-dev pkg-config  
+      - name: Build release with Matrix  
+        run: cargo build --release --locked --features channel-matrix  
+      - name: Upload artifact  
+        uses: actions/upload-artifact@v4  
+        with:  
+          name: zeroclaw-linux-x86_64-matrix  
+          path: target/release/zeroclaw  
+          retention-days: 30
