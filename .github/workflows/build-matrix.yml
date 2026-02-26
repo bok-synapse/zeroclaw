@@ -15,7 +15,7 @@ jobs:
       - name: Install libudev  
         run: sudo apt-get install -y libudev-dev pkg-config  
       - name: Build release with Matrix  
-        run: cargo build --release --locked --features channel-matrix  
+        run: cargo build --release --features channel-matrix  
       - name: Upload artifact  
         uses: actions/upload-artifact@v4  
         with:  
