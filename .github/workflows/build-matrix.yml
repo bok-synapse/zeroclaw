@@ -29,9 +29,7 @@ jobs:
       - name: Build release binary  
         shell: bash  
         run: |  
-          cargo build --profile release-fast --locked \  
-            --target x86_64-unknown-linux-gnu \  
-            --features channel-matrix  
+          cargo build --profile release-fast --locked --features channel-matrix --target x86_64-unknown-linux-gnu
   
       - name: Package binary  
         run: |  
