@@ -10,7 +10,9 @@
 //! ```
 
 use super::AppState;
-use crate::agent::loop_::run_tool_call_loop;
+use crate::agent::loop_::{
+    build_shell_policy_instructions, build_tool_instructions_from_specs, run_tool_call_loop,
+};
 use crate::approval::ApprovalManager;
 use crate::providers::ChatMessage;
 use axum::{
@@ -22,6 +24,9 @@ use axum::{
     response::IntoResponse,
 };
 
+const EMPTY_WS_RESPONSE_FALLBACK: &str =
+    "Tool execution completed, but the model returned no final text response. Please ask me to summarize the result.";
+
 fn sanitize_ws_response(response: &str, tools: &[Box<dyn crate::tools::Tool>]) -> String {
     let sanitized = crate::channels::sanitize_channel_response(response, tools);
     if sanitized.is_empty() && !response.trim().is_empty() {
@@ -30,6 +35,121 @@ fn sanitize_ws_response(response: &str, tools: &[Box<dyn crate::tools::Tool>]) -
     } else {
         sanitized
     }
+}
+
+fn normalize_prompt_tool_results(content: &str) -> Option<String> {
+    let mut cleaned_lines: Vec<&str> = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with("<tool_result") || trimmed == "</tool_result>" {
+            continue;
+        }
+        cleaned_lines.push(line.trim_end());
+    }
+
+    if cleaned_lines.is_empty() {
+        None
+    } else {
+        Some(cleaned_lines.join("\n"))
+    }
+}
+
+fn extract_latest_tool_output(history: &[ChatMessage]) -> Option<String> {
+    for msg in history.iter().rev() {
+        match msg.role.as_str() {
+            "tool" => {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(&msg.content) {
+                    if let Some(content) = value
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .map(str::trim)
+                        .filter(|v| !v.is_empty())
+                    {
+                        return Some(content.to_string());
+                    }
+                }
+
+                let trimmed = msg.content.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+            "user" => {
+                if let Some(payload) = msg.content.strip_prefix("[Tool results]") {
+                    let payload = payload.trim_start_matches('\n');
+                    if let Some(cleaned) = normalize_prompt_tool_results(payload) {
+                        return Some(cleaned);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn finalize_ws_response(
+    response: &str,
+    history: &[ChatMessage],
+    tools: &[Box<dyn crate::tools::Tool>],
+) -> String {
+    let sanitized = sanitize_ws_response(response, tools);
+    if !sanitized.trim().is_empty() {
+        return sanitized;
+    }
+
+    if let Some(tool_output) = extract_latest_tool_output(history) {
+        let excerpt = crate::util::truncate_with_ellipsis(tool_output.trim(), 1200);
+        return format!(
+            "Tool execution completed, but the model returned no final text response.\n\nLatest tool output:\n{excerpt}"
+        );
+    }
+
+    EMPTY_WS_RESPONSE_FALLBACK.to_string()
+}
+
+fn build_ws_system_prompt(
+    config: &crate::config::Config,
+    model: &str,
+    tools_registry: &[Box<dyn crate::tools::Tool>],
+    native_tools: bool,
+) -> String {
+    let mut tool_specs: Vec<crate::tools::ToolSpec> =
+        tools_registry.iter().map(|tool| tool.spec()).collect();
+    tool_specs.sort_by(|a, b| a.name.cmp(&b.name));
+
+    let tool_descs: Vec<(&str, &str)> = tool_specs
+        .iter()
+        .map(|spec| (spec.name.as_str(), spec.description.as_str()))
+        .collect();
+
+    let bootstrap_max_chars = if config.agent.compact_context {
+        Some(6000)
+    } else {
+        None
+    };
+
+    let mut prompt = crate::channels::build_system_prompt_with_mode(
+        &config.workspace_dir,
+        model,
+        &tool_descs,
+        &[],
+        Some(&config.identity),
+        bootstrap_max_chars,
+        native_tools,
+        config.skills.prompt_injection_mode,
+    );
+    if !native_tools {
+        prompt.push_str(&build_tool_instructions_from_specs(&tool_specs));
+    }
+    prompt.push_str(&build_shell_policy_instructions(&config.autonomy));
+
+    prompt
 }
 
 /// GET /ws/chat — WebSocket upgrade for agent chat
@@ -61,13 +181,11 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
     // Build system prompt once for the session
     let system_prompt = {
         let config_guard = state.config.lock();
-        crate::channels::build_system_prompt(
-            &config_guard.workspace_dir,
+        build_ws_system_prompt(
+            &config_guard,
             &state.model,
-            &[],
-            &[],
-            Some(&config_guard.identity),
-            None,
+            state.tools_registry_exec.as_ref(),
+            state.provider.supports_native_tools(),
         )
     };
 
@@ -105,6 +223,24 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
         if content.is_empty() {
             continue;
         }
+        let perplexity_cfg = { state.config.lock().security.perplexity_filter.clone() };
+        if let Some(assessment) =
+            crate::security::detect_adversarial_suffix(&content, &perplexity_cfg)
+        {
+            let err = serde_json::json!({
+                "type": "error",
+                "message": format!(
+                    "Input blocked by security.perplexity_filter: perplexity={:.2} (threshold {:.2}), symbol_ratio={:.2} (threshold {:.2}), suspicious_tokens={}.",
+                    assessment.perplexity,
+                    perplexity_cfg.perplexity_threshold,
+                    assessment.symbol_ratio,
+                    perplexity_cfg.symbol_ratio_threshold,
+                    assessment.suspicious_token_count
+                ),
+            });
+            let _ = socket.send(Message::Text(err.to_string().into())).await;
+            continue;
+        }
 
         // Add user message to history
         history.push(ChatMessage::user(&content));
@@ -124,31 +260,11 @@ async fn handle_socket(mut socket: WebSocket, state: AppState) {
             "model": state.model,
         }));
 
-        // Run the agent loop with tool execution
-        let result = run_tool_call_loop(
-            state.provider.as_ref(),
-            &mut history,
-            state.tools_registry_exec.as_ref(),
-            state.observer.as_ref(),
-            &provider_label,
-            &state.model,
-            state.temperature,
-            true, // silent - no console output
-            Some(&approval_manager),
-            "webchat",
-            &state.multimodal,
-            state.max_tool_iterations,
-            None, // cancellation token
-            None, // delta streaming
-            None, // hooks
-            &[],  // excluded tools
-        )
-        .await;
-
-        match result {
+        // Full agentic loop with tools (includes WASM skills, shell, memory, etc.)
+        match super::run_gateway_chat_with_tools(&state, &content).await {
             Ok(response) => {
                 let safe_response =
-                    sanitize_ws_response(&response, state.tools_registry_exec.as_ref());
+                    finalize_ws_response(&response, &history, state.tools_registry_exec.as_ref());
                 // Add assistant response to history
                 history.push(ChatMessage::assistant(&safe_response));
 
@@ -327,5 +443,68 @@ Reminder set successfully."#;
         assert_eq!(result, "Reminder set successfully.");
         assert!(!result.contains("\"name\":\"schedule\""));
         assert!(!result.contains("\"result\""));
+    }
+
+    #[test]
+    fn build_ws_system_prompt_includes_tool_protocol_for_prompt_mode() {
+        let config = crate::config::Config::default();
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
+
+        let prompt = build_ws_system_prompt(&config, "test-model", &tools, false);
+
+        assert!(prompt.contains("## Tool Use Protocol"));
+        assert!(prompt.contains("**schedule**"));
+        assert!(prompt.contains("## Shell Policy"));
+    }
+
+    #[test]
+    fn build_ws_system_prompt_omits_xml_protocol_for_native_mode() {
+        let config = crate::config::Config::default();
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
+
+        let prompt = build_ws_system_prompt(&config, "test-model", &tools, true);
+
+        assert!(!prompt.contains("## Tool Use Protocol"));
+        assert!(prompt.contains("**schedule**"));
+        assert!(prompt.contains("## Shell Policy"));
+    }
+
+    #[test]
+    fn finalize_ws_response_uses_prompt_mode_tool_output_when_final_text_empty() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
+        let history = vec![
+            ChatMessage::system("sys"),
+            ChatMessage::user(
+                "[Tool results]\n<tool_result name=\"schedule\">\nDisk usage: 72%\n</tool_result>",
+            ),
+        ];
+
+        let result = finalize_ws_response("", &history, &tools);
+        assert!(result.contains("Latest tool output:"));
+        assert!(result.contains("Disk usage: 72%"));
+        assert!(!result.contains("<tool_result"));
+    }
+
+    #[test]
+    fn finalize_ws_response_uses_native_tool_message_output_when_final_text_empty() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
+        let history = vec![ChatMessage {
+            role: "tool".to_string(),
+            content: r#"{"tool_call_id":"call_1","content":"Filesystem /dev/disk3s1: 210G free"}"#
+                .to_string(),
+        }];
+
+        let result = finalize_ws_response("", &history, &tools);
+        assert!(result.contains("Latest tool output:"));
+        assert!(result.contains("/dev/disk3s1"));
+    }
+
+    #[test]
+    fn finalize_ws_response_uses_static_fallback_when_nothing_available() {
+        let tools: Vec<Box<dyn Tool>> = vec![Box::new(MockScheduleTool)];
+        let history = vec![ChatMessage::system("sys")];
+
+        let result = finalize_ws_response("", &history, &tools);
+        assert_eq!(result, EMPTY_WS_RESPONSE_FALLBACK);
     }
 }
